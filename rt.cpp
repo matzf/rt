@@ -10,16 +10,16 @@
 
 static constexpr float ray_mint = 1e-3f;
 
-static void writeImage(int *idImage, float *depthImage, int width, int height, const char *filename) {
+static void writeImage(int *idImage, float *image, int width, int height, const char *filename) {
     FILE *f = fopen(filename, "wb");
     if (!f) {
         perror(filename);
         exit(1);
     }
 
-    float max_depth = *std::max_element(depthImage, depthImage + width * height);
-    max_depth = std::max(max_depth, 0.03f);
-    printf("%f\n", max_depth);
+    float max_val = *std::max_element(image, image + width * height);
+    max_val = std::max(max_val, 0.03f);
+    printf("%f\n", max_val);
 
     fprintf(f, "P6\n%d %d\n255\n", width, height);
     for (int y = 0; y < height; ++y) {
@@ -40,13 +40,17 @@ static void writeImage(int *idImage, float *depthImage, int width, int height, c
                 g |= gbit << (7 - i);
                 b |= bbit << (7 - i);
             }
-            float d = depthImage[y * width + x] / max_depth;
+            float d = image[y * width + x] / max_val;
+            /*
             r *= d;
             g *= d;
             b *= d;
+            */
+            r = g = b = 255 * d;
             fputc(r, f);
             fputc(g, f);
             fputc(b, f);
+
         }
     }
     fclose(f);
@@ -120,9 +124,13 @@ struct Light {
   float intensity;
 };
 
+template<typename T>
+struct vec : public std::vector<T> {
+  size_t num; // num _valid_ entries in this vector
+};
+
 struct Scene {
-  Sphere8 spheres;
-  uint32_t numSpheres;
+  vec<Sphere8> spheres;
   std::vector<Light> lights;
 };
 
@@ -309,7 +317,15 @@ static std::optional<Hit> hit_spheres(const Sphere8 &spheres, size_t n, const Ra
 }
 
 static std::optional<Hit> hit(const Scene &scene, const Ray &ray) {
-  return hit_spheres(scene.spheres, scene.numSpheres, ray);
+  std::optional<Hit> closest_hit;
+  for(size_t i = 0, n = scene.spheres.size(); i < n; ++i) {
+    size_t num8 = (i < n-1) ? 8 : scene.spheres.num % 8;
+    std::optional h = hit_spheres_f(scene.spheres[i], num8, ray);
+    if(!closest_hit || h->t < closest_hit->t) {
+      closest_hit = h;
+    }
+  }
+  return closest_hit;
 }
 
 static bool hit_any(const Scene &scene, const Ray &ray, float maxt)
@@ -320,6 +336,7 @@ static bool hit_any(const Scene &scene, const Ray &ray, float maxt)
   }
   return false;
 
+  /*
   const Sphere8 &spheres = scene.spheres;
   for(uint32_t i = 0; i < scene.numSpheres; ++i) {
     Vec3f c{spheres.x[i], spheres.y[i], spheres.z[i]};
@@ -335,6 +352,7 @@ static bool hit_any(const Scene &scene, const Ray &ray, float maxt)
     }
   }
   return false;
+  */
 }
 
 static std::unique_ptr<Scene> make_scene()
@@ -347,40 +365,43 @@ static std::unique_ptr<Scene> make_scene()
     float r;
   };
 
-  /*
   Sphere spheres[] = { { Vec3f{0.f, 3.f, 25.f}, 3.f },
                        { Vec3f{0.f, -2.5f, 25.f}, 2.5f },
                        { Vec3f{0.f, 1.5f, 21.8f}, 0.15f },
                        { Vec3f{1.f, 0.5f, 21.4f}, 0.1f },
                        { Vec3f{-1.f, -0.5f, 20.f}, 0.3f },
                        { Vec3f{-1.5f, 0.f, 21.f}, 0.6f },
-                       { Vec3f{5.f, 0.5f, 24.f}, 1.5f },
-                       { Vec3f{.5f, -4.f, 15.f}, 0.8f },
-                     };
-  */
-  Sphere spheres[] = {
-                       { Vec3f{0.f, 3.f, 25.f}, 3.f },
-                       { Vec3f{0.f, -2.5f, 25.f}, 2.5f },
-                       { Vec3f{0.f, 1.5f, 21.8f}, 0.15f },
-                       { Vec3f{1.f, 0.5f, 21.4f}, 0.1f },
-                       { Vec3f{-1.f, -0.5f, 20.f}, 0.3f },
-                       { Vec3f{-1.5f, 0.f, 21.f}, 0.6f },
-                       { Vec3f{5.f, 0.5f, 24.f}, 1.5f },
-                       { Vec3f{.5f, -4.f, 15.f}, 0.8f },
+                       { Vec3f{0.f, 0.f, 150.f}, 100.f },
+                       { Vec3f{0.f, 115.f, 0.f}, 100.f },
+                       { Vec3f{-5.f, 1.f, 18.5f}, 2.f },
+                       { Vec3f{-4.f, 3.f, 23.f}, 1.5f },
                      };
 
-  size_t i = 0;
-  for(const Sphere &s : spheres) {
-    scene->spheres.x[i] = s.p.x;
-    scene->spheres.y[i] = s.p.y;
-    scene->spheres.z[i] = s.p.z;
-    scene->spheres.rSq[i] = sq(s.r);
-    ++i;
+
+  // XXX This is ugly as fuck
+  auto it = std::begin(spheres);
+  size_t numSpheres = std::distance(it, std::end(spheres));
+  scene->spheres.resize((numSpheres + 8 - 1) / 8);
+  for(size_t k = 0; k < 8; ++k) {
+    Sphere8 &s8 = scene->spheres[k];
+    for(size_t i = 0; i < 8 && it != std::end(spheres); ++i) {
+      const Sphere& s = *it++;
+      s8.x[i] = s.p.x;
+      s8.y[i] = s.p.y;
+      s8.z[i] = s.p.z;
+      s8.rSq[i] = sq(s.r);
+    }
   }
-  scene->numSpheres = i;
+  for(size_t i = 8 - numSpheres % 8 - 1; i < 8; ++i) { // fill remaining entries
+    scene->spheres.back().x[i] = INFINITY;
+    scene->spheres.back().y[i] = INFINITY;
+    scene->spheres.back().z[i] = INFINITY;
+    scene->spheres.back().rSq[i] = 0.f;
+  }
+  scene->spheres.num = numSpheres;
 
   scene->lights.emplace_back(Vec3f{0.f, 10.f, 20.f}, 10.f);
-  scene->lights.emplace_back(Vec3f{-10.f, 1.f, 20.f}, 10.f);
+  scene->lights.emplace_back(Vec3f{-10.f, 10.f, 20.f}, 10.f);
   return scene;
 }
 
@@ -420,7 +441,7 @@ static Vec3f sample_hemisphere(Vec3f n) {
 }
 
 static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
-  constexpr size_t numSamples = 4;
+  constexpr size_t numSamples = 16;
   constexpr float albedo = 0.75f;
   float l = 0.f;
   for(size_t i = 0; i < numSamples; ++i) {
@@ -435,8 +456,8 @@ static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
 }
 
 int main() {
-  constexpr size_t width = 5000;
-  constexpr size_t height = 5000;
+  constexpr size_t width = 1000;
+  constexpr size_t height = 1000;
 
   auto scene = make_scene();
 
