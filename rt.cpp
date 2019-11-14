@@ -69,6 +69,7 @@ static float sq(float f) {
   return f*f;
 }
 
+namespace {
 struct alignas(16) Vec3f {
   float x,y,z;
 
@@ -111,64 +112,14 @@ static void println(Vec3f a) {
   printf("%f %f %f\n", a.x, a.y, a.z);
 }
 
-struct alignas(32) Sphere8 {
-  float x[8];
-  float y[8];
-  float z[8];
-  float rSq[8];
-};
-
-struct Light {
-  Light(Vec3f p_, float intensity_) : p(p_), intensity(intensity_) {};
-  Vec3f p;
-  float intensity;
-};
-
-template<typename T>
-struct vec : public std::vector<T> {
-  size_t num; // num _valid_ entries in this vector
-};
-
-struct Scene {
-  vec<Sphere8> spheres;
-  std::vector<Light> lights;
-};
-
-struct Ray {
-  Vec3f p, d;
-};
-
-struct Hit {
-  Hit(Vec3f p_, float t_, Vec3f n_, uint32_t id_) : p(p_), t(t_), n(n_), id(id_) {}
-  Vec3f p;
-  float t;
-  Vec3f n;
-  uint32_t id;
-};
-
-static Ray generate_ray(float x, float y) {
-  //   /|
-  //  / |
-  // .  |
-  //  \ |
-  //   \|
-
-  Vec3f p{x, y, 0.f};
-
-  constexpr float fdist = 3.f;
-
-  Vec3f d = Vec3f{x/fdist, y/fdist, 1.f}.normalized();
-  return Ray{p,d};
-}
-
 struct Vec3f8 {
   __m256 x, y, z;
 
   static Vec3f8 splat(Vec3f v) {
     return Vec3f8{
-      _mm256_broadcast_ss(&v.x),
-      _mm256_broadcast_ss(&v.y),
-      _mm256_broadcast_ss(&v.z)
+      _mm256_set1_ps(v.x),
+      _mm256_set1_ps(v.y),
+      _mm256_set1_ps(v.z)
     };
   }
   static Vec3f8 load(const float *x, const float *y, const float *z) {
@@ -193,11 +144,66 @@ struct Vec3f8 {
       _mm256_sub_ps(a.z, b.z)
     };
   }
+
+  static Vec3f at(const Vec3f8 &a, size_t i) {
+    return Vec3f {
+      a.x[i],
+      a.y[i],
+      a.z[i],
+    };
+  }
+
+  static void println(Vec3f8 &a) {
+    for(size_t i = 0; i < 7; ++i) {
+      printf("[%f %f %f] ", a.x[i], a.y[i], a.z[i]);
+    }
+    printf("[%f %f %f]\n", a.x[7], a.y[7], a.z[7]);
+  }
+};
+
+struct Ray {
+  Vec3f p, d;
+};
+
+struct Ray8 {
+  Vec3f8 p, d;
+};
+
+struct alignas(32) Sphere8 {
+  float x[8];
+  float y[8];
+  float z[8];
+  float rSq[8];
+};
+
+struct Light {
+  Light(Vec3f p_, float intensity_) : p(p_), intensity(intensity_) {};
+  Vec3f p;
+  float intensity;
+};
+
+template<typename T>
+struct vec : public std::vector<T> {
+  size_t num; // num _valid_ entries in this vector
+};
+
+struct Scene {
+  vec<Sphere8> spheres;
+  std::vector<Light> lights;
 };
 
 
+struct Hit {
+  Hit(Vec3f p_, float t_, Vec3f n_, uint32_t id_) : p(p_), t(t_), n(n_), id(id_) {}
+  Vec3f p;
+  float t;
+  Vec3f n;
+  uint32_t id;
+};
+} // namespace
+
 // Compute horizontal minimum. Does not consider NaNs (dont know what happens).
-static void min_horiz(__m256 a, int *min_idx, float *min_val) {
+static void argmin_horiz(__m256 a, int *min_idx, float *min_val) {
   __m128 a_lo = _mm256_castps256_ps128(a);
   __m128 a_hi = _mm256_extractf128_ps(a, 1);
   __m128 b = _mm_min_ps(a_lo, a_hi); // 4
@@ -221,6 +227,8 @@ static void min_horiz(__m256 a, int *min_idx, float *min_val) {
 
 static std::optional<Hit> hit_spheres_f(const Sphere8 &spheres, size_t n, const Ray &ray)
 {
+  (void)n; // unused, assume that all entries either valid or setup s.t. they will hit at infinity/nan
+
   const __m256 inf = _mm256_set1_ps(INFINITY);
   const __m256 negHalf = _mm256_set1_ps(-0.5f);
   const __m256 zero = _mm256_setzero_ps();
@@ -259,7 +267,7 @@ static std::optional<Hit> hit_spheres_f(const Sphere8 &spheres, size_t n, const 
 
   float tmin;
   int id;
-  min_horiz(t, &id, &tmin);
+  argmin_horiz(t, &id, &tmin);
 
   if(tmin < INFINITY) {
     Vec3f p = ray.p + ray.d * tmin;
@@ -365,25 +373,45 @@ static std::unique_ptr<Scene> make_scene()
     float r;
   };
 
-  Sphere spheres[] = { { Vec3f{0.f, 3.f, 25.f}, 3.f },
-                       { Vec3f{0.f, -2.5f, 25.f}, 2.5f },
-                       { Vec3f{0.f, 1.5f, 21.8f}, 0.15f },
-                       { Vec3f{1.f, 0.5f, 21.4f}, 0.1f },
-                       { Vec3f{-1.f, -0.5f, 20.f}, 0.3f },
-                       { Vec3f{-1.5f, 0.f, 21.f}, 0.6f },
-                       { Vec3f{0.f, 0.f, 150.f}, 100.f },
-                       { Vec3f{0.f, 115.f, 0.f}, 100.f },
-                       { Vec3f{-5.f, 1.f, 18.5f}, 2.f },
-                       { Vec3f{-4.f, 3.f, 23.f}, 1.5f },
-                     };
+  std::vector<Sphere> spheres = {
+    { Vec3f{0.f, 3.f, 25.f}, 3.f },
+    { Vec3f{0.f, -2.5f, 25.f}, 2.5f },
+    { Vec3f{0.f, 1.5f, 21.8f}, 0.15f },
+    { Vec3f{1.f, 0.5f, 21.4f}, 0.1f },
+    { Vec3f{-1.f, -0.5f, 20.f}, 0.3f },
+    { Vec3f{-1.5f, 0.f, 21.f}, 0.6f },
+    { Vec3f{0.f, 0.f, 150.f}, 100.f },
+    { Vec3f{0.f, 115.f, 0.f}, 100.f },
+    { Vec3f{-5.f, 1.f, 18.5f}, 2.f },
+    { Vec3f{-4.f, 3.f, 23.f}, 1.5f },
+  };
 
+
+  const Vec3f gridO{-7.5f, -5.f, 1.f};
+  const size_t gridN = 10;
+  const float gridRadius = 0.1f;
+  const Vec3f gridRig = Vec3f{1.0f, 0.0f, 0.0f};
+  const Vec3f gridUp  = Vec3f{0.5f, 1.0f, 0.f};
+  const Vec3f gridFwd = Vec3f{0.0f, 0.0f, 3.f};
+  for(size_t x = 0; x < gridN; ++x) {
+    for(size_t y = 0; y < gridN; ++y) {
+      for(size_t z = 0; z < gridN+1; ++z) {
+        Vec3f pos = gridO
+                    + gridRig * x
+                    + gridUp * y
+                    + gridFwd * z;
+        spheres.push_back(Sphere{pos, gridRadius});
+      }
+    }
+  }
+
+  printf("%zu\n", spheres.size());
 
   // XXX This is ugly as fuck
   auto it = std::begin(spheres);
   size_t numSpheres = std::distance(it, std::end(spheres));
   scene->spheres.resize((numSpheres + 8 - 1) / 8);
-  for(size_t k = 0; k < 8; ++k) {
-    Sphere8 &s8 = scene->spheres[k];
+  for(Sphere8 &s8 : scene->spheres) {
     for(size_t i = 0; i < 8 && it != std::end(spheres); ++i) {
       const Sphere& s = *it++;
       s8.x[i] = s.p.x;
@@ -392,15 +420,17 @@ static std::unique_ptr<Scene> make_scene()
       s8.rSq[i] = sq(s.r);
     }
   }
-  for(size_t i = 8 - numSpheres % 8 - 1; i < 8; ++i) { // fill remaining entries
-    scene->spheres.back().x[i] = INFINITY;
-    scene->spheres.back().y[i] = INFINITY;
-    scene->spheres.back().z[i] = INFINITY;
-    scene->spheres.back().rSq[i] = 0.f;
+  if(numSpheres % 8 != 0) {
+    for(size_t i = numSpheres % 8; i < 8; ++i) { // fill remaining entries
+      scene->spheres.back().x[i] = INFINITY;
+      scene->spheres.back().y[i] = INFINITY;
+      scene->spheres.back().z[i] = INFINITY;
+      scene->spheres.back().rSq[i] = 0.f;
+    }
   }
   scene->spheres.num = numSpheres;
 
-  scene->lights.emplace_back(Vec3f{0.f, 10.f, 20.f}, 10.f);
+  //scene->lights.emplace_back(Vec3f{0.f, 10.f, 20.f}, 10.f);
   scene->lights.emplace_back(Vec3f{-10.f, 10.f, 20.f}, 10.f);
   return scene;
 }
@@ -423,6 +453,14 @@ static float direct(const Scene &scene, Vec3f p, Vec3f n) {
   return l;
 }
 
+static Ray generate_ray(float x, float y) {
+  constexpr float fdist = 3.f;
+  Vec3f p{x, y, 0.f};
+  Vec3f d = Vec3f{x/fdist, y/fdist, 1.f}.normalized();
+  return Ray{p,d};
+}
+
+__attribute__((unused))
 static Vec3f sample_hemisphere(Vec3f n) {
   // sample hemisphere
   float a = 2.f*frand()-1.f;
@@ -440,15 +478,122 @@ static Vec3f sample_hemisphere(Vec3f n) {
   }
 }
 
+struct xorshift32_state8 {
+  __m256i a;
+};
+
+static xorshift32_state8 seed_xorshift328(uint32_t s) {
+  // Avoid 0.
+  if (s + 7 < s) {
+    s += 8;
+  }
+  return xorshift32_state8{
+    _mm256_set_epi32(s, s+1, s+2, s+3, s+4, s+5, s+6, s+7)
+  };
+}
+
+static __m256i xorshift328(xorshift32_state8 *state) {
+  __m256i x = state->a;
+  //x ^= x << 13;
+  //x ^= x >> 17;
+  //x ^= x << 5;
+  x = _mm256_xor_si256(x, _mm256_slli_epi32(x, 13));
+  x = _mm256_xor_si256(x, _mm256_srli_epi32(x, 17));
+  x = _mm256_xor_si256(x, _mm256_slli_epi32(x, 5));
+  state->a = x;
+  return x;
+}
+
+__attribute__((unused))
+static __m256 frand8(xorshift32_state8 *rng_state) {
+  __m256i r = xorshift328(rng_state);
+  // shift right 9, leaves 23 random bits for mantissa
+  __m256i m = _mm256_srli_epi32(r, 9);
+
+  __m256 one = _mm256_set1_ps(1.f);
+  // bitwise or with 1.f sets the exponent bits so that the value of the float is in [1.f, 2.f)
+  __m256 r1 = _mm256_or_ps(_mm256_castsi256_ps(m), one);
+  // subtracting one gives a range [0.f, 1.f).
+  return _mm256_sub_ps(r1, one);
+}
+
+static __m256 frand_posneg8(xorshift32_state8 *rng_state) {
+  __m256i r = xorshift328(rng_state);
+  // shift left 31 to get random sign bit
+  __m256i s = _mm256_slli_epi32(r, 31);
+  // shift right 9, leaves 23 random bits for mantissa
+  __m256i m = _mm256_srli_epi32(r, 9);
+
+  __m256 one = _mm256_set1_ps(1.f);
+  // bitwise or of sign bit with 1.f, gives +/-1.f
+  __m256 one_s = _mm256_or_ps(one, _mm256_castsi256_ps(s));
+  // bitwise or with +/-1.f sets the sign and exponent bits so that the value of the float is in +/-[1.f, 2.f).
+  __m256 r1 = _mm256_or_ps(_mm256_castsi256_ps(m), one_s);
+  // for positive r1: subtract 1.f
+  // for negative r1: subtract -1.f
+  // gives a range (-1.f, 1.f).
+  return _mm256_sub_ps(r1, one_s);
+}
+
+
+static xorshift32_state8 rng_state = seed_xorshift328(1);
+
+
+static __m256 copysign_ps(__m256 mag, __m256 sig) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_or_ps(_mm256_and_ps(sig_mask, sig), _mm256_andnot_ps(sig_mask, mag)); // (mask & sig) | (~mask & mag)
+}
+
+static __m256 abs_ps(__m256 x) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_andnot_ps(sig_mask, x);
+}
+
+static __m256 sigbit_ps(__m256 x) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_and_ps(sig_mask, x);
+}
+
+__attribute__((unused))
+static void println_ps(__m256 x) {
+  for(size_t i = 0; i < 7; ++i) {
+    printf("%f ", x[i]);
+  }
+  printf("%f\n", x[7]);
+}
+
+static Vec3f8 sample_hemisphere8(Vec3f n) {
+  __m256 one = _mm256_set1_ps(1.f);
+  __m256 a = frand_posneg8(&rng_state);
+  __m256 b = frand_posneg8(&rng_state);
+  __m256 xSq = abs_ps(a);
+  __m256 x = copysign_ps(_mm256_sqrt_ps(xSq), a);
+  __m256 ySq = _mm256_mul_ps(abs_ps(b), _mm256_sub_ps(one, xSq));
+  __m256 y = copysign_ps(_mm256_sqrt_ps(ySq), b);
+  __m256 z = _mm256_sqrt_ps(_mm256_sub_ps(_mm256_sub_ps(one, xSq), ySq));
+  Vec3f8 r{x,y,z};
+  __m256 d = Vec3f8::dot(Vec3f8::splat(n), r);
+  __m256 dsigbit = sigbit_ps(d);
+  // flip sign of all coordinates if d is negative
+  r.x = _mm256_xor_ps(r.x, dsigbit);
+  r.y = _mm256_xor_ps(r.y, dsigbit);
+  r.z = _mm256_xor_ps(r.z, dsigbit);
+  return r;
+}
+
 static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
-  constexpr size_t numSamples = 16;
+  constexpr size_t numSampleRounds = 1;
+  constexpr size_t numSamples = numSampleRounds * 8;
   constexpr float albedo = 0.75f;
   float l = 0.f;
-  for(size_t i = 0; i < numSamples; ++i) {
-    Vec3f dir = sample_hemisphere(n);
-    auto h = hit(scene, Ray{p, dir});
-    if(h) {
-      l += albedo * dot(dir, n) * direct(scene, h->p + h->n, h->n); // numBounces: + indirect(scene, h->p, h-n);
+  for(size_t k = 0; k < numSampleRounds; ++k) {
+    Vec3f8 dir8 = sample_hemisphere8(n);
+    for(size_t i = 0; i < 8; ++i) {
+      Vec3f dir = Vec3f8::at(dir8, i);
+      auto h = hit(scene, Ray{p, dir});
+      if(h) {
+        l += albedo * dot(dir, n) * direct(scene, h->p + h->n, h->n); // numBounces: + indirect(scene, h->p, h-n);
+      }
     }
   }
   l /= (float)numSamples;
