@@ -669,7 +669,7 @@ static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
     for(size_t i = 0; i < 8; ++i) {
       float t = hits.t[i];
       if(t < INFINITY) {
-        Vec3f dir = Vec3f8::at(dir8, i).normalized();
+        Vec3f dir = Vec3f8::at(dir8, i);
         Vec3f hp = Vec3f8::at(hits.p, i);
         Vec3f hn = Vec3f8::at(hits.n, i);
         l += albedo * dot(dir, n) * direct(scene, hp, hn); // numBounces: + indirect(scene, h->p, h-n);
