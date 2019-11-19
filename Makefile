@@ -16,7 +16,7 @@ rt: rt.cpp
 
 .PHONY: run
 run: rt
-	time ./rt && geeqie foo.ppm
+	time -p ./rt && geeqie foo.ppm
 
 .PHONY: debug
 gdb: CXXFLAGS=$(CXXFLAGS_BASE) $(CXXFLAGS_DEBUG)
