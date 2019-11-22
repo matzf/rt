@@ -1,6 +1,6 @@
 CXX=g++
 CXXFLAGS_BASE=-std=c++1z -march=broadwell -mtune=broadwell -Wall -Wextra
-CXXFLAGS_RELEASE=-DNDEBUG -O3
+CXXFLAGS_RELEASE=-DNDEBUG -O3 -g3
 CXXFLAGS_DEBUG=-DDEBUG -O0 -g3
 
 DEBUG ?= 0

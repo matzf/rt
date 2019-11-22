@@ -112,6 +112,53 @@ static void println(Vec3f a) {
   printf("%f %f %f\n", a.x, a.y, a.z);
 }
 
+
+
+
+static __m256 copysign_ps(__m256 mag, __m256 sig) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_or_ps(_mm256_and_ps(sig_mask, sig), _mm256_andnot_ps(sig_mask, mag)); // (mask & sig) | (~mask & mag)
+}
+
+static __m256 abs_ps(__m256 x) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_andnot_ps(sig_mask, x);
+}
+
+static __m256 sigbit_ps(__m256 x) {
+  auto const sig_mask = _mm256_set1_ps(-0.f);
+  return _mm256_and_ps(sig_mask, x);
+}
+
+static __m256 sq_ps(__m256 x) {
+  return _mm256_mul_ps(x, x);
+}
+
+static float hsum_ps(__m256 a) {
+  __m128 a_lo = _mm256_castps256_ps128(a);
+  __m128 a_hi = _mm256_extractf128_ps(a, 1);
+  __m128 b = _mm_add_ps(a_lo, a_hi); // 4
+
+  __m128 b_lo = b;
+  __m128 b_hi = _mm_permute_ps(b, 2 | 3<<2); // rest 2 entries ignored
+  __m128 c = _mm_add_ps(b_lo, b_hi); // 2
+
+  __m128 c_lo = c;
+  __m128 c_hi = _mm_permute_ps(c, 1); // rest 3 entries ignored
+  __m128 d = _mm_add_ps(c_lo, c_hi); // 1
+
+  return _mm_cvtss_f32(d);
+}
+
+__attribute__((unused))
+static void println_ps(__m256 x) {
+  for(size_t i = 0; i < 7; ++i) {
+    printf("%f ", x[i]);
+  }
+  printf("%f\n", x[7]);
+}
+
+
 struct Vec3f8 {
   __m256 x, y, z;
 
@@ -170,9 +217,12 @@ struct Vec3f8 {
     };
   }
 
+  static __m256 rlength(const Vec3f8 &a) {
+    return _mm256_rsqrt_ps(dot(a, a));
+  }
+
   static Vec3f8 normalized(const Vec3f8 &a) {
-    __m256 lenSq = dot(a, a);
-    return scale(a, _mm256_rsqrt_ps(lenSq));
+    return scale(a, rlength(a));
   }
 
   static void println(Vec3f8 &a) {
@@ -295,25 +345,21 @@ struct Hit8 {
 
 static Hit8 hit_ray8(const Scene &scene, const Ray8 &rays)
 {
-  bool first = true;
-  __m256 tmin;
+  __m256 tmin = _mm256_set1_ps(INFINITY);
   Vec3f8 cmin;
   for(const Sphere8 &spheres : scene.spheres) {
     for(size_t i = 0; i < 8; ++i) {
       Vec3f8 c = Vec3f8::splat(Vec3f{spheres.x[i], spheres.y[i], spheres.z[i]});
       __m256 rSq = _mm256_set1_ps(spheres.rSq[i]);
       __m256 t = hit_sphere_ray8(c, rSq, rays);
-      if(first) {
-        tmin = t;
-        cmin = c;
-        first = false;
-      } else {
-        __m256 m = _mm256_cmp_ps(t, tmin, _CMP_LT_OQ);
-        tmin = _mm256_blendv_ps(tmin, t, m);
-        cmin.x = _mm256_blendv_ps(cmin.x, c.x, m);
-        cmin.y = _mm256_blendv_ps(cmin.y, c.y, m);
-        cmin.z = _mm256_blendv_ps(cmin.z, c.z, m);
+      __m256 m = _mm256_cmp_ps(t, tmin, _CMP_LT_OQ);
+      if(_mm256_movemask_ps(m) == 0) {
+        continue;
       }
+      tmin = _mm256_blendv_ps(tmin, t, m);
+      cmin.x = _mm256_blendv_ps(cmin.x, c.x, m);
+      cmin.y = _mm256_blendv_ps(cmin.y, c.y, m);
+      cmin.z = _mm256_blendv_ps(cmin.z, c.z, m);
     }
   }
 
@@ -509,6 +555,25 @@ static std::unique_ptr<Scene> make_scene()
   return scene;
 }
 
+static __m256 direct8(const Scene &scene, Vec3f8 p, Vec3f8 n) {
+  __m256 le = _mm256_setzero_ps();
+  for(const auto &light : scene.lights) {
+    Vec3f8 lp = Vec3f8::splat(light.p);
+    const Vec3f8 lv = Vec3f8::sub(lp, p);
+    const __m256 ldistSq = Vec3f8::dot(lv, lv);
+    const Vec3f8 ldir = Vec3f8::scale(lv, _mm256_rsqrt_ps(ldistSq));
+    const __m256 cosPhi = Vec3f8::dot(n, ldir);
+
+    Hit8 hits = hit_ray8(scene, Ray8{p, ldir}); // XXX skip comp for cosPhi <= 0
+
+    __m256 lel = _mm256_div_ps(cosPhi, ldistSq);
+    lel = _mm256_and_ps(lel, _mm256_cmp_ps(cosPhi, _mm256_setzero_ps(), _CMP_GT_OQ));
+    lel = _mm256_and_ps(lel, _mm256_cmp_ps(sq_ps(hits.t), ldistSq, _CMP_GT_OQ));
+    le = _mm256_fmadd_ps(lel, _mm256_set1_ps(light.intensity), le);
+  }
+  return le;
+}
+
 static float direct(const Scene &scene, Vec3f p, Vec3f n) {
   float l = 0.f;
   for(const auto &light : scene.lights) {
@@ -613,30 +678,7 @@ static __m256 frand_posneg8(xorshift32_state8 *rng_state) {
 static xorshift32_state8 rng_state = seed_xorshift328(1);
 
 
-static __m256 copysign_ps(__m256 mag, __m256 sig) {
-  auto const sig_mask = _mm256_set1_ps(-0.f);
-  return _mm256_or_ps(_mm256_and_ps(sig_mask, sig), _mm256_andnot_ps(sig_mask, mag)); // (mask & sig) | (~mask & mag)
-}
-
-static __m256 abs_ps(__m256 x) {
-  auto const sig_mask = _mm256_set1_ps(-0.f);
-  return _mm256_andnot_ps(sig_mask, x);
-}
-
-static __m256 sigbit_ps(__m256 x) {
-  auto const sig_mask = _mm256_set1_ps(-0.f);
-  return _mm256_and_ps(sig_mask, x);
-}
-
-__attribute__((unused))
-static void println_ps(__m256 x) {
-  for(size_t i = 0; i < 7; ++i) {
-    printf("%f ", x[i]);
-  }
-  printf("%f\n", x[7]);
-}
-
-static Vec3f8 sample_hemisphere8(Vec3f n) {
+static Vec3f8 sample_hemisphere8(Vec3f8 n) {
   __m256 one = _mm256_set1_ps(1.f);
   __m256 a = frand_posneg8(&rng_state);
   __m256 b = frand_posneg8(&rng_state);
@@ -646,7 +688,7 @@ static Vec3f8 sample_hemisphere8(Vec3f n) {
   __m256 y = copysign_ps(_mm256_sqrt_ps(ySq), b);
   __m256 z = _mm256_sqrt_ps(_mm256_sub_ps(_mm256_sub_ps(one, xSq), ySq));
   Vec3f8 r{x,y,z};
-  __m256 d = Vec3f8::dot(Vec3f8::splat(n), r);
+  __m256 d = Vec3f8::dot(n, r);
   __m256 dsigbit = sigbit_ps(d);
   // flip sign of all coordinates if d is negative
   r.x = _mm256_xor_ps(r.x, dsigbit);
@@ -659,34 +701,57 @@ static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
   constexpr size_t numSampleRounds = 1;
   constexpr size_t numSamples = numSampleRounds * 8;
   constexpr float albedo = 0.75f;
+
+#if 0
+  const __m256 albedo8 = _mm256_set1_ps(albedo);
+  const Vec3f8 p8 = Vec3f8::splat(p);
+  const Vec3f8 n8 = Vec3f8::splat(n);
+  __m256 l = _mm256_setzero_ps();
+
+  for(size_t k = 0; k < numSampleRounds; ++k)
+  {
+    Vec3f8 dir8 = sample_hemisphere8(n8);
+    Hit8 hits = hit_ray8(scene, Ray8{p8, dir8});
+
+    __m256 ishit = _mm256_cmp_ps(hits.t, _mm256_set1_ps(INFINITY), _CMP_LT_OQ);
+    if(_mm256_movemask_ps(ishit) == 0) {
+      continue;
+    }
+    // XXX: coalesce only hits???
+    __m256 ldirect = direct8(scene, hits.p, hits.n);
+
+    __m256 w = _mm256_mul_ps(Vec3f8::dot(dir8, n8), albedo8);
+    w = _mm256_and_ps(w, ishit);
+    l = _mm256_fmadd_ps(w, ldirect, l);
+  }
+  return hsum_ps(l) / numSamples;
+#else
   float l = 0.f;
   const Vec3f8 p8 = Vec3f8::splat(p);
   for(size_t k = 0; k < numSampleRounds; ++k) {
-    Vec3f8 dir8 = sample_hemisphere8(n);
-# if 1
+#if 0
+    Vec3f8 dir8 = sample_hemisphere8(Vec3f8::splat(n));
     Hit8 hits = hit_ray8(scene, Ray8{p8, dir8});
-
-    for(size_t i = 0; i < 8; ++i) {
-      float t = hits.t[i];
-      if(t < INFINITY) {
-        Vec3f dir = Vec3f8::at(dir8, i);
-        Vec3f hp = Vec3f8::at(hits.p, i);
-        Vec3f hn = Vec3f8::at(hits.n, i);
-        l += albedo * dot(dir, n) * direct(scene, hp, hn); // numBounces: + indirect(scene, h->p, h-n);
-      }
-    }
-#else
     for(size_t i = 0; i < 8; ++i) {
       Vec3f dir = Vec3f8::at(dir8, i);
       auto h = hit(scene, Ray{p, dir});
       if(h) {
-        l += albedo * dot(dir, n) * direct(scene, h->p + h->n, h->n); // numBounces: + indirect(scene, h->p, h-n);
+        l += albedo * dot(dir, n) * direct(scene, h->p, h->n); // numBounces: + indirect(scene, h->p, h-n);
+      }
+    }
+#else
+    for(size_t i = 0; i < 8; ++i) {
+      Vec3f dir = sample_hemisphere(n);
+      auto h = hit(scene, Ray{p, dir});
+      if(h) {
+        l += albedo * dot(dir, n) * direct(scene, h->p, h->n); // numBounces: + indirect(scene, h->p, h-n);
       }
     }
 #endif
   }
   l /= (float)numSamples;
   return l;
+#endif
 }
 
 int main() {
