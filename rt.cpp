@@ -239,6 +239,7 @@ struct Ray {
 
 struct Ray8 {
   Vec3f8 p, d;
+  __m256 valid;
 };
 
 struct alignas(32) Sphere8 {
@@ -298,7 +299,7 @@ static void argmin_horiz(__m256 a, int *min_idx, float *min_val) {
 }
 
 // Solve quadratic equation, and return smaller solution >= ray_mint
-static __m256 quadratic_ps(__m256 A, __m256 B, __m256 C) {
+static __m256 quadratic_ps(__m256 A, __m256 B, __m256 C, __m256 valid) {
   const __m256 inf = _mm256_set1_ps(INFINITY);
   const __m256 zero = _mm256_setzero_ps();
   const __m256 negHalf = _mm256_set1_ps(-0.5f);
@@ -309,7 +310,8 @@ static __m256 quadratic_ps(__m256 A, __m256 B, __m256 C) {
   __m256 discrim = _mm256_sub_ps(_mm256_mul_ps(B, B), AC4);
 
   __m256 discrim_nonneg = _mm256_cmp_ps(discrim, zero, _CMP_GE_OQ);
-  if(_mm256_movemask_ps(discrim_nonneg) == 0) {
+  __m256 hit = _mm256_and_ps(discrim_nonneg, valid);
+  if(_mm256_movemask_ps(hit) == 0) {
     return inf;
   }
 
@@ -333,7 +335,7 @@ static __m256 hit_sphere_ray8(const Vec3f8 &c, const __m256 rSq, const Ray8 &ray
   __m256 B = _mm256_mul_ps(_mm256_set1_ps(2.f), Vec3f8::dot(o, rays.d));
   __m256 C = _mm256_sub_ps(Vec3f8::dot(o, o), rSq);
 
-  return quadratic_ps(A, B, C);
+  return quadratic_ps(A, B, C, rays.valid);
 }
 
 
@@ -369,6 +371,7 @@ static Hit8 hit_ray8(const Scene &scene, const Ray8 &rays)
 }
 
 
+
 static std::optional<Hit> hit_spheres_f(const Sphere8 &spheres, size_t n, const Ray &ray)
 {
   (void)n;
@@ -383,7 +386,8 @@ static std::optional<Hit> hit_spheres_f(const Sphere8 &spheres, size_t n, const 
   __m256 B = _mm256_mul_ps(_mm256_set1_ps(2.f), Vec3f8::dot(o, d));
   __m256 C = _mm256_sub_ps(Vec3f8::dot(o, o), rSq);
 
-  __m256 t = quadratic_ps(A, B, C);
+  __m256 valid = _mm256_cvtepi32_ps(_mm256_set1_epi32(~0)); // XXX
+  __m256 t = quadratic_ps(A, B, C, valid);
 
   float tmin;
   int id;
@@ -555,7 +559,7 @@ static std::unique_ptr<Scene> make_scene()
   return scene;
 }
 
-static __m256 direct8(const Scene &scene, Vec3f8 p, Vec3f8 n) {
+static __m256 direct8(const Scene &scene, Vec3f8 p, Vec3f8 n, __m256 valid) {
   __m256 le = _mm256_setzero_ps();
   for(const auto &light : scene.lights) {
     Vec3f8 lp = Vec3f8::splat(light.p);
@@ -564,10 +568,12 @@ static __m256 direct8(const Scene &scene, Vec3f8 p, Vec3f8 n) {
     const Vec3f8 ldir = Vec3f8::scale(lv, _mm256_rsqrt_ps(ldistSq));
     const __m256 cosPhi = Vec3f8::dot(n, ldir);
 
-    Hit8 hits = hit_ray8(scene, Ray8{p, ldir}); // XXX skip comp for cosPhi <= 0
+    const __m256 mask = _mm256_and_ps(valid, _mm256_cmp_ps(cosPhi, _mm256_setzero_ps(), _CMP_GT_OQ));
+
+    Hit8 hits = hit_ray8(scene, Ray8{p, ldir, mask});
 
     __m256 lel = _mm256_div_ps(cosPhi, ldistSq);
-    lel = _mm256_and_ps(lel, _mm256_cmp_ps(cosPhi, _mm256_setzero_ps(), _CMP_GT_OQ));
+    lel = _mm256_and_ps(lel, mask);
     lel = _mm256_and_ps(lel, _mm256_cmp_ps(sq_ps(hits.t), ldistSq, _CMP_GT_OQ));
     le = _mm256_fmadd_ps(lel, _mm256_set1_ps(light.intensity), le);
   }
@@ -593,6 +599,14 @@ static Ray generate_ray(float x, float y) {
   Vec3f p{x, y, 0.f};
   Vec3f d = Vec3f{x/fdist, y/fdist, 1.f}.normalized();
   return Ray{p,d};
+}
+
+static Ray8 generate_ray8(__m256 x, __m256 y) {
+  constexpr float fdist = 3.f;
+  __m256 rfdist = _mm256_set1_ps(1.f/fdist);
+  Vec3f8 p{x, y, _mm256_setzero_ps()};
+  Vec3f8 d = Vec3f8::normalized(Vec3f8{_mm256_mul_ps(x, rfdist), _mm256_mul_ps(y, rfdist), _mm256_set1_ps(1.f)});
+  return Ray8{p, d, _mm256_set1_ps(1.f)};
 }
 
 static float frand() {
@@ -711,14 +725,14 @@ static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
   for(size_t k = 0; k < numSampleRounds; ++k)
   {
     Vec3f8 dir8 = sample_hemisphere8(n8);
-    Hit8 hits = hit_ray8(scene, Ray8{p8, dir8});
+    Hit8 hits = hit_ray8(scene, Ray8{p8, dir8, _mm256_cvtepi32_ps(_mm256_set1_epi32(~0))});
 
     __m256 ishit = _mm256_cmp_ps(hits.t, _mm256_set1_ps(INFINITY), _CMP_LT_OQ);
     if(_mm256_movemask_ps(ishit) == 0) {
       continue;
     }
     // XXX: coalesce only hits???
-    __m256 ldirect = direct8(scene, hits.p, hits.n);
+    __m256 ldirect = direct8(scene, hits.p, hits.n, ishit);
 
     __m256 w = _mm256_mul_ps(Vec3f8::dot(dir8, n8), albedo8);
     w = _mm256_and_ps(w, ishit);
@@ -729,14 +743,16 @@ static float indirect(const Scene &scene, Vec3f p, Vec3f n) {
   float l = 0.f;
   const Vec3f8 p8 = Vec3f8::splat(p);
   for(size_t k = 0; k < numSampleRounds; ++k) {
-#if 0
+#if 1
     Vec3f8 dir8 = sample_hemisphere8(Vec3f8::splat(n));
-    Hit8 hits = hit_ray8(scene, Ray8{p8, dir8});
+    Hit8 hits = hit_ray8(scene, Ray8{p8, dir8, _mm256_cvtepi32_ps(_mm256_set1_epi32(~0))});
     for(size_t i = 0; i < 8; ++i) {
       Vec3f dir = Vec3f8::at(dir8, i);
-      auto h = hit(scene, Ray{p, dir});
-      if(h) {
-        l += albedo * dot(dir, n) * direct(scene, h->p, h->n); // numBounces: + indirect(scene, h->p, h-n);
+      Vec3f hp = Vec3f8::at(hits.p, i);
+      Vec3f hn = Vec3f8::at(hits.n, i);
+      float ht = hits.t[i];
+      if(ht < INFINITY) {
+        l += albedo * dot(dir, n) * direct(scene, hp, hn);
       }
     }
 #else
@@ -763,6 +779,7 @@ int main() {
   int *id = new int[width * height];
   float *depth = new float[width * height];
 
+#if 0
   for(size_t x = 0; x < width; x++) {
     for(size_t y = 0; y < height; y++) {
       Ray ray = generate_ray(2.f*(float)x/(width-1) - 1.f, -2.f*(float)y/(height-1) + 1.f);
@@ -776,6 +793,23 @@ int main() {
       }
     }
   }
+#else
+  for(size_t x = 0; x < width; x+=8) {
+    for(size_t y = 0; y < height; y+=8) {
+      Ray ray = generate_ray(2.f*(float)x/(width-1) - 1.f, -2.f*(float)y/(height-1) + 1.f);
+
+      auto h = hit(*scene, ray);
+      if(h) {
+        float l = direct(*scene, h->p, h->n) + indirect(*scene, h->p, h->n);
+        //float l = indirect(*scene, h->p, h->n);
+        id[y * width + x] = h->id + 10;
+        depth[y * width + x] = l;
+      }
+    }
+  }
+
+
+#endif
   writeImage(id, depth, width, height, "foo.ppm");
   delete id;
   delete depth;
